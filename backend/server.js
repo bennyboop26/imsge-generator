@@ -3,36 +3,30 @@ import cors from 'cors';
 import multer from 'multer';
 import { createClient } from '@supabase/supabase-js';
 import { createClient as deepgramClient } from '@deepgram/sdk';
-import FormData from 'form-data';
 import fetch from 'node-fetch';
 import fs from 'fs';
 import dotenv from 'dotenv';
 
-// Load environment variables
 dotenv.config();
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
-// Environment variables (no hardcoded secrets)
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const DEEPGRAM_KEY = process.env.DEEPGRAM_KEY;
 const HF_KEY = process.env.HF_KEY;
 
-// Initialize clients
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const deepgram = deepgramClient(DEEPGRAM_KEY);
 
 app.use(cors());
 app.use(express.json());
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'AI Video Backend Running' });
 });
 
-// 1. TRANSCRIBE AUDIO (Deepgram)
 app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) {
@@ -56,8 +50,7 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
     
     res.json({ 
       transcript,
-      confidence: result.results.channels[0].alternatives[0].confidence,
-      words: result.results.channels[0].alternatives[0].words
+      confidence: result.results.channels[0].alternatives[0].confidence
     });
 
   } catch (error) {
@@ -66,7 +59,6 @@ app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
   }
 });
 
-// 2. GENERATE IMAGE (Hugging Face)
 app.post('/api/generate-image', async (req, res) => {
   try {
     const { prompt } = req.body;
@@ -75,8 +67,11 @@ app.post('/api/generate-image', async (req, res) => {
       return res.status(400).json({ error: 'Prompt required' });
     }
 
+    console.log('Generating image for:', prompt);
+
+    // Using a different model - SDXL through Hugging Face Inference API
     const response = await fetch(
-      'https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0',
+      'https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell',
       {
         method: 'POST',
         headers: {
@@ -84,23 +79,22 @@ app.post('/api/generate-image', async (req, res) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ 
-          inputs: prompt,
-          parameters: {
-            num_inference_steps: 30,
-            guidance_scale: 7.5
-          }
+          inputs: prompt
         }),
       }
     );
 
     if (!response.ok) {
+      const errorText = await response.text();
+      console.error('HF API error:', response.status, errorText);
       throw new Error(`HF API error: ${response.status}`);
     }
 
-    const imageBuffer = await response.buffer();
+    const imageBuffer = Buffer.from(await response.arrayBuffer());
     const base64Image = imageBuffer.toString('base64');
     const imageUrl = `data:image/png;base64,${base64Image}`;
 
+    console.log('Image generated successfully');
     res.json({ imageUrl, prompt });
 
   } catch (error) {
@@ -109,10 +103,9 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
-// 3. TEXT TO SPEECH (Deepgram)
 app.post('/api/text-to-speech', async (req, res) => {
   try {
-    const { text, voice = 'aura-luna-en' } = req.body;
+    const { text } = req.body;
     
     if (!text) {
       return res.status(400).json({ error: 'Text required' });
@@ -143,15 +136,29 @@ app.post('/api/text-to-speech', async (req, res) => {
   }
 });
 
-// 4. SAVE CONVERSATION (Supabase)
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { message, history } = req.body;
+    
+    // Simple response for now - you can integrate Mistral/Llama later
+    const response = `I received: "${message}". This is a demo response. In production, this would be an AI model response.`;
+    
+    res.json({ response });
+
+  } catch (error) {
+    console.error('Chat error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/save-conversation', async (req, res) => {
   try {
-    const { session_id, user_message, ai_response, image_url, video_url, audio_url } = req.body;
+    const { session_id, role, content, type, media_url } = req.body;
 
     const { data, error } = await supabase
       .from('conversations')
       .insert([
-        { session_id, user_message, ai_response, image_url, video_url, audio_url }
+        { session_id, role, content, type, media_url }
       ])
       .select();
 
@@ -165,7 +172,6 @@ app.post('/api/save-conversation', async (req, res) => {
   }
 });
 
-// 5. GET CONVERSATION HISTORY
 app.get('/api/conversations/:session_id', async (req, res) => {
   try {
     const { session_id } = req.params;
@@ -182,20 +188,6 @@ app.get('/api/conversations/:session_id', async (req, res) => {
 
   } catch (error) {
     console.error('Fetch error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 6. LIP SYNC (Placeholder)
-app.post('/api/lip-sync', upload.fields([{ name: 'image' }, { name: 'audio' }]), async (req, res) => {
-  try {
-    res.json({ 
-      message: 'Lip-sync endpoint ready',
-      note: 'For demo, use pre-generated video or integrate Wav2Lip space',
-      imageReceived: !!req.files.image,
-      audioReceived: !!req.files.audio
-    });
-  } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });

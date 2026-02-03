@@ -6,19 +6,25 @@ const API_URL = 'http://localhost:3000';
 
 export default function Home() {
   const [sessionId, setSessionId] = useState<string>('');
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [activeTab, setActiveTab] = useState<'chat' | 'create'>('chat');
+  
+  // Chat state
+  const [chatInput, setChatInput] = useState('');
+  const [messages, setMessages] = useState<Array<{role: string, content: string, type?: string, media_url?: string}>>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  
+  // Creation state
   const [imagePrompt, setImagePrompt] = useState('');
-  const [cameraMovement, setCameraMovement] = useState('zoom-in');
   const [transcript, setTranscript] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [generatedAudio, setGeneratedAudio] = useState<string | null>(null);
-  const [conversations, setConversations] = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
   
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
-  // Generate session ID only on client side
   useEffect(() => {
     setSessionId(crypto.randomUUID());
   }, []);
@@ -29,14 +35,73 @@ export default function Home() {
     }
   }, [sessionId]);
 
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
   const fetchConversations = async () => {
     try {
       const res = await fetch(`${API_URL}/api/conversations/${sessionId}`);
       const data = await res.json();
-      setConversations(data.conversations || []);
+      setMessages(data.conversations || []);
     } catch (error) {
       console.error('Failed to load conversations:', error);
     }
+  };
+
+  const sendMessage = async () => {
+    if (!chatInput.trim()) return;
+    
+    const userMessage = chatInput;
+    setChatInput('');
+    setIsLoading(true);
+    
+    // Add user message immediately
+    const newMessages = [...messages, { role: 'user', content: userMessage }];
+    setMessages(newMessages);
+    
+    // Save to database
+    await fetch(`${API_URL}/api/save-conversation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sessionId,
+        role: 'user',
+        content: userMessage,
+        type: 'text'
+      }),
+    });
+
+    // Get AI response
+    try {
+      const res = await fetch(`${API_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMessage, history: messages }),
+      });
+      
+      const data = await res.json();
+      
+      // Add AI response
+      setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
+      
+      // Save AI response
+      await fetch(`${API_URL}/api/save-conversation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          role: 'assistant',
+          content: data.response,
+          type: 'text'
+        }),
+      });
+      
+    } catch (error) {
+      console.error('Chat error:', error);
+    }
+    
+    setIsLoading(false);
   };
 
   const startRecording = async () => {
@@ -69,7 +134,7 @@ export default function Home() {
   };
 
   const transcribeAudio = async (audioBlob: Blob) => {
-    setLoading(true);
+    setIsLoading(true);
     try {
       const formData = new FormData();
       formData.append('audio', audioBlob, 'recording.wav');
@@ -81,17 +146,29 @@ export default function Home() {
 
       const data = await res.json();
       setTranscript(data.transcript);
-      await saveConversation(data.transcript, null, null, null);
+      
+      await fetch(`${API_URL}/api/save-conversation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          role: 'user',
+          content: data.transcript,
+          type: 'transcript'
+        }),
+      });
+      
+      fetchConversations();
     } catch (error) {
       alert('Transcription failed: ' + error);
     }
-    setLoading(false);
+    setIsLoading(false);
   };
 
   const generateImage = async () => {
     if (!imagePrompt) return alert('Enter image prompt');
     
-    setLoading(true);
+    setIsLoading(true);
     try {
       const res = await fetch(`${API_URL}/api/generate-image`, {
         method: 'POST',
@@ -101,17 +178,38 @@ export default function Home() {
 
       const data = await res.json();
       setGeneratedImage(data.imageUrl);
-      await saveConversation(imagePrompt, null, data.imageUrl, null);
+      
+      // Add to chat
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: `Generated image: ${imagePrompt}`,
+        type: 'image',
+        media_url: data.imageUrl
+      }]);
+      
+      await fetch(`${API_URL}/api/save-conversation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          role: 'assistant',
+          content: imagePrompt,
+          type: 'image',
+          media_url: data.imageUrl
+        }),
+      });
+      
+      fetchConversations();
     } catch (error) {
       alert('Image generation failed: ' + error);
     }
-    setLoading(false);
+    setIsLoading(false);
   };
 
   const generateSpeech = async () => {
     if (!transcript) return alert('No transcript to speak');
     
-    setLoading(true);
+    setIsLoading(true);
     try {
       const res = await fetch(`${API_URL}/api/text-to-speech`, {
         method: 'POST',
@@ -121,165 +219,401 @@ export default function Home() {
 
       const data = await res.json();
       setGeneratedAudio(data.audioUrl);
-      await saveConversation(transcript, data.audioUrl, null, null);
-    } catch (error) {
-      alert('Speech generation failed: ' + error);
-    }
-    setLoading(false);
-  };
-
-  const saveConversation = async (message: string, audioUrl: string | null, imageUrl: string | null, videoUrl: string | null) => {
-    try {
+      
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: `Generated speech: "${transcript.substring(0, 50)}..."`,
+        type: 'audio',
+        media_url: data.audioUrl
+      }]);
+      
       await fetch(`${API_URL}/api/save-conversation`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
-          user_message: message,
-          audio_url: audioUrl,
-          image_url: imageUrl,
-          video_url: videoUrl,
+          role: 'assistant',
+          content: transcript,
+          type: 'audio',
+          media_url: data.audioUrl
         }),
       });
+      
       fetchConversations();
     } catch (error) {
-      console.error('Save failed:', error);
+      alert('Speech generation failed: ' + error);
     }
+    setIsLoading(false);
   };
 
   return (
-    <div style={{ display: 'flex', height: '100vh', fontFamily: 'Arial, sans-serif', backgroundColor: '#f5f5f5' }}>
-      <div style={{ flex: 1, padding: '20px', overflow: 'auto' }}>
-        <h1 style={{ color: '#333', marginBottom: '20px' }}>AI Video Generator</h1>
-        
-        <div style={{ backgroundColor: 'white', border: '1px solid #ddd', padding: '20px', marginBottom: '20px', borderRadius: '8px' }}>
-          <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', color: '#333', fontWeight: 'bold' }}>Image Prompt:</label>
-            <textarea
-              value={imagePrompt}
-              onChange={(e) => setImagePrompt(e.target.value)}
-              placeholder="A futuristic robot in a garden..."
-              style={{ width: '100%', height: '80px', padding: '8px', border: '1px solid #ccc', borderRadius: '4px', color: '#333' }}
-            />
-            <button 
-              onClick={generateImage} 
-              disabled={loading}
-              style={{ backgroundColor: '#007bff', color: 'white', padding: '10px 20px', border: 'none', borderRadius: '4px', marginTop: '10px', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}
-            >
-              Generate Image
-            </button>
-          </div>
+    <div style={{ display: 'flex', height: '100vh', fontFamily: 'Arial, sans-serif', backgroundColor: '#343541' }}>
+      {/* Collapsible Sidebar */}
+      <div style={{ 
+        width: sidebarOpen ? '260px' : '0px', 
+        backgroundColor: '#202123',
+        borderRight: '1px solid #4d4d4f',
+        transition: 'width 0.3s',
+        overflow: 'hidden',
+        display: 'flex',
+        flexDirection: 'column'
+      }}>
+        <div style={{ padding: '10px', borderBottom: '1px solid #4d4d4f' }}>
+          <button 
+            onClick={() => setActiveTab('chat')}
+            style={{
+              width: '100%',
+              padding: '10px',
+              marginBottom: '5px',
+              backgroundColor: activeTab === 'chat' ? '#40414f' : 'transparent',
+              color: 'white',
+              border: '1px solid #4d4d4f',
+              borderRadius: '6px',
+              cursor: 'pointer',
+              textAlign: 'left'
+            }}
+          >
+            💬 Chat
+          </button>
+          <button 
+            onClick={() => setActiveTab('create')}
+            style={{
+              width: '100%',
+              padding: '10px',
+              backgroundColor: activeTab === 'create' ? '#40414f' : 'transparent',
+              color: 'white',
+              border: '1px solid #4d4d4f',
+              borderRadius: '6px',
+              cursor: 'pointer',
+              textAlign: 'left'
+            }}
+          >
+            🎨 Create Video
+          </button>
+        </div>
 
-          <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', color: '#333', fontWeight: 'bold' }}>Camera Movement:</label>
-            <select 
-              value={cameraMovement} 
-              onChange={(e) => setCameraMovement(e.target.value)}
-              style={{ padding: '8px', border: '1px solid #ccc', borderRadius: '4px', color: '#333' }}
-            >
-              <option value="zoom-in">Zoom In</option>
-              <option value="zoom-out">Zoom Out</option>
-              <option value="pan-left">Pan Left</option>
-              <option value="pan-right">Pan Right</option>
-              <option value="rotate">Rotate</option>
-            </select>
+        <div style={{ flex: 1, overflow: 'auto', padding: '10px' }}>
+          <div style={{ color: '#8e8ea0', fontSize: '12px', marginBottom: '10px' }}>
+            Session: {sessionId.slice(0, 8)}...
           </div>
-
-          <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', color: '#333', fontWeight: 'bold' }}>Audio Input:</label>
-            <button 
-              onClick={isRecording ? stopRecording : startRecording}
-              style={{ 
-                backgroundColor: isRecording ? '#dc3545' : '#28a745', 
-                color: 'white', 
-                padding: '10px 20px', 
-                border: 'none', 
-                borderRadius: '4px',
-                cursor: 'pointer'
+          
+          {messages.map((msg, idx) => (
+            <div 
+              key={idx}
+              onClick={() => {
+                if (msg.media_url) {
+                  if (msg.type === 'image') setGeneratedImage(msg.media_url);
+                  if (msg.type === 'audio') setGeneratedAudio(msg.media_url);
+                  setActiveTab('create');
+                }
+              }}
+              style={{
+                padding: '10px',
+                marginBottom: '5px',
+                backgroundColor: msg.role === 'user' ? '#343541' : '#40414f',
+                borderRadius: '6px',
+                cursor: msg.media_url ? 'pointer' : 'default',
+                fontSize: '13px',
+                color: '#ececf1',
+                border: '1px solid transparent',
+                transition: 'all 0.2s'
+              }}
+              onMouseEnter={(e) => {
+                if (msg.media_url) {
+                  e.currentTarget.style.borderColor = '#10a37f';
+                }
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.borderColor = 'transparent';
               }}
             >
-              {isRecording ? 'Stop Recording' : 'Start Recording'}
-            </button>
-            {transcript && (
-              <div style={{ marginTop: '10px', padding: '10px', backgroundColor: '#f8f9fa', borderRadius: '4px', color: '#333' }}>
-                <strong>Transcript:</strong> {transcript}
+              <div style={{ fontSize: '11px', color: '#8e8ea0', marginBottom: '3px' }}>
+                {msg.role === 'user' ? 'You' : 'AI'} • {msg.type || 'text'}
               </div>
-            )}
-          </div>
-
-          <div style={{ marginBottom: '15px' }}>
-            <label style={{ display: 'block', marginBottom: '5px', color: '#333', fontWeight: 'bold' }}>Or type script:</label>
-            <textarea
-              value={transcript}
-              onChange={(e) => setTranscript(e.target.value)}
-              placeholder="Enter text to convert to speech..."
-              style={{ width: '100%', height: '60px', padding: '8px', border: '1px solid #ccc', borderRadius: '4px', color: '#333' }}
-            />
-            <button 
-              onClick={generateSpeech} 
-              disabled={loading}
-              style={{ backgroundColor: '#6f42c1', color: 'white', padding: '10px 20px', border: 'none', borderRadius: '4px', marginTop: '10px', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1 }}
-            >
-              Generate Speech
-            </button>
-          </div>
-        </div>
-
-        <div style={{ backgroundColor: 'white', border: '1px solid #ddd', padding: '20px', borderRadius: '8px' }}>
-          <h3 style={{ color: '#333', marginBottom: '15px' }}>Generated Assets</h3>
-          
-          {generatedImage && (
-            <div style={{ marginBottom: '20px' }}>
-              <p style={{ color: '#333' }}>Generated Image:</p>
-              <img src={generatedImage} alt="Generated" style={{ maxWidth: '400px', borderRadius: '8px' }} />
+              <div style={{ 
+                overflow: 'hidden', 
+                textOverflow: 'ellipsis', 
+                whiteSpace: 'nowrap' 
+              }}>
+                {msg.content}
+              </div>
+              {msg.media_url && (
+                <div style={{ fontSize: '11px', color: '#10a37f', marginTop: '5px' }}>
+                  📎 Click to view
+                </div>
+              )}
             </div>
-          )}
-
-          {generatedAudio && (
-            <div style={{ marginBottom: '20px' }}>
-              <p style={{ color: '#333' }}>Generated Audio:</p>
-              <audio controls src={generatedAudio} style={{ width: '100%' }} />
-            </div>
-          )}
-
-          <div style={{ marginTop: '20px', padding: '15px', backgroundColor: '#fff3cd', borderRadius: '8px', color: '#856404' }}>
-            <strong>Lip-Sync Video:</strong>
-            <p>Status: Ready for integration</p>
-          </div>
+          ))}
         </div>
       </div>
 
-      <div style={{ width: '300px', borderLeft: '1px solid #ddd', padding: '20px', backgroundColor: 'white', overflow: 'auto' }}>
-        <h3 style={{ color: '#333', marginBottom: '10px' }}>Conversation History</h3>
-        <p style={{ fontSize: '12px', color: '#666', marginBottom: '15px' }}>Session: {sessionId ? sessionId.slice(0,8) : '...'}...</p>
-        
-        {conversations.map((conv, idx) => (
-          <div key={idx} style={{ marginBottom: '15px', padding: '10px', backgroundColor: '#f8f9fa', borderRadius: '6px', fontSize: '14px' }}>
-            <div style={{ color: '#666', fontSize: '12px', marginBottom: '5px' }}>
-              {new Date(conv.created_at).toLocaleTimeString()}
+      {/* Main Content */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        {/* Header */}
+        <div style={{ 
+          padding: '10px 20px', 
+          backgroundColor: '#343541',
+          borderBottom: '1px solid #4d4d4f',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px'
+        }}>
+          <button 
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            style={{
+              backgroundColor: 'transparent',
+              border: '1px solid #4d4d4f',
+              color: 'white',
+              padding: '8px 12px',
+              borderRadius: '6px',
+              cursor: 'pointer'
+            }}
+          >
+            {sidebarOpen ? '←' : '→'}
+          </button>
+          <h1 style={{ color: 'white', margin: 0, fontSize: '18px' }}>
+            {activeTab === 'chat' ? 'AI Chat' : 'AI Video Generator'}
+          </h1>
+        </div>
+
+        {/* Content Area */}
+        <div style={{ flex: 1, overflow: 'auto', padding: '20px' }}>
+          {activeTab === 'chat' ? (
+            // Chat Interface
+            <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+              <div style={{ marginBottom: '20px' }}>
+                {messages.filter(m => m.type === 'text' || !m.type).map((msg, idx) => (
+                  <div 
+                    key={idx}
+                    style={{
+                      padding: '15px 20px',
+                      backgroundColor: msg.role === 'user' ? '#343541' : '#444654',
+                      borderBottom: '1px solid #4d4d4f',
+                      color: '#ececf1'
+                    }}
+                  >
+                    <div style={{ fontWeight: 'bold', marginBottom: '5px', color: msg.role === 'user' ? '#fff' : '#10a37f' }}>
+                      {msg.role === 'user' ? 'You' : 'AI'}
+                    </div>
+                    <div style={{ lineHeight: '1.5' }}>{msg.content}</div>
+                  </div>
+                ))}
+                <div ref={messagesEndRef} />
+              </div>
+
+              {/* Chat Input */}
+              <div style={{ 
+                position: 'sticky', 
+                bottom: '20px', 
+                backgroundColor: '#40414f',
+                borderRadius: '12px',
+                padding: '10px',
+                display: 'flex',
+                gap: '10px',
+                border: '1px solid #4d4d4f'
+              }}>
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                  placeholder="Message..."
+                  style={{
+                    flex: 1,
+                    backgroundColor: 'transparent',
+                    border: 'none',
+                    color: 'white',
+                    fontSize: '16px',
+                    outline: 'none',
+                    padding: '5px'
+                  }}
+                />
+                <button 
+                  onClick={sendMessage}
+                  disabled={isLoading || !chatInput.trim()}
+                  style={{
+                    backgroundColor: '#10a37f',
+                    color: 'white',
+                    border: 'none',
+                    padding: '8px 16px',
+                    borderRadius: '6px',
+                    cursor: isLoading ? 'not-allowed' : 'pointer',
+                    opacity: isLoading ? 0.6 : 1
+                  }}
+                >
+                  {isLoading ? '...' : '➤'}
+                </button>
+              </div>
             </div>
-            <div style={{ color: '#333' }}>
-              <strong>You:</strong> {conv.user_message.slice(0, 100)}...
+          ) : (
+            // Create Video Interface
+            <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+              <div style={{ backgroundColor: '#40414f', padding: '20px', borderRadius: '12px', marginBottom: '20px' }}>
+                <h2 style={{ color: 'white', marginBottom: '20px' }}>Create Video</h2>
+                
+                {/* Image Generation */}
+                <div style={{ marginBottom: '20px' }}>
+                  <label style={{ display: 'block', color: '#ececf1', marginBottom: '8px', fontWeight: 'bold' }}>
+                    Image Prompt:
+                  </label>
+                  <textarea
+                    value={imagePrompt}
+                    onChange={(e) => setImagePrompt(e.target.value)}
+                    placeholder="A futuristic robot in a garden..."
+                    style={{
+                      width: '100%',
+                      height: '80px',
+                      padding: '10px',
+                      backgroundColor: '#343541',
+                      border: '1px solid #4d4d4f',
+                      borderRadius: '8px',
+                      color: 'white',
+                      fontSize: '14px',
+                      resize: 'vertical'
+                    }}
+                  />
+                  <button 
+                    onClick={generateImage}
+                    disabled={isLoading}
+                    style={{
+                      backgroundColor: '#10a37f',
+                      color: 'white',
+                      border: 'none',
+                      padding: '10px 20px',
+                      borderRadius: '8px',
+                      marginTop: '10px',
+                      cursor: isLoading ? 'not-allowed' : 'pointer',
+                      opacity: isLoading ? 0.6 : 1
+                    }}
+                  >
+                    Generate Image
+                  </button>
+                </div>
+
+                {/* Audio Input */}
+                <div style={{ marginBottom: '20px' }}>
+                  <label style={{ display: 'block', color: '#ececf1', marginBottom: '8px', fontWeight: 'bold' }}>
+                    Audio / Script:
+                  </label>
+                  <button 
+                    onClick={isRecording ? stopRecording : startRecording}
+                    style={{
+                      backgroundColor: isRecording ? '#dc3545' : '#6f42c1',
+                      color: 'white',
+                      border: 'none',
+                      padding: '10px 20px',
+                      borderRadius: '8px',
+                      cursor: 'pointer',
+                      marginRight: '10px'
+                    }}
+                  >
+                    {isRecording ? '⏹ Stop Recording' : '🎤 Start Recording'}
+                  </button>
+                  
+                  {transcript && (
+                    <div style={{ 
+                      marginTop: '10px', 
+                      padding: '10px', 
+                      backgroundColor: '#343541',
+                      borderRadius: '8px',
+                      color: '#ececf1'
+                    }}>
+                      <strong>Transcript:</strong> {transcript}
+                    </div>
+                  )}
+                </div>
+
+                {/* Script Input */}
+                <div style={{ marginBottom: '20px' }}>
+                  <textarea
+                    value={transcript}
+                    onChange={(e) => setTranscript(e.target.value)}
+                    placeholder="Or type your script here..."
+                    style={{
+                      width: '100%',
+                      height: '60px',
+                      padding: '10px',
+                      backgroundColor: '#343541',
+                      border: '1px solid #4d4d4f',
+                      borderRadius: '8px',
+                      color: 'white',
+                      fontSize: '14px',
+                      resize: 'vertical'
+                    }}
+                  />
+                  <button 
+                    onClick={generateSpeech}
+                    disabled={isLoading || !transcript}
+                    style={{
+                      backgroundColor: '#007bff',
+                      color: 'white',
+                      border: 'none',
+                      padding: '10px 20px',
+                      borderRadius: '8px',
+                      marginTop: '10px',
+                      cursor: isLoading ? 'not-allowed' : 'pointer',
+                      opacity: isLoading ? 0.6 : 1
+                    }}
+                  >
+                    Generate Speech
+                  </button>
+                </div>
+              </div>
+
+              {/* Generated Assets */}
+              <div style={{ backgroundColor: '#40414f', padding: '20px', borderRadius: '12px' }}>
+                <h3 style={{ color: 'white', marginBottom: '15px' }}>Generated Assets</h3>
+                
+                {generatedImage && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <p style={{ color: '#ececf1', marginBottom: '10px' }}>Generated Image:</p>
+                    <img 
+                      src={generatedImage} 
+                      alt="Generated" 
+                      style={{ maxWidth: '100%', borderRadius: '8px', border: '1px solid #4d4d4f' }} 
+                    />
+                  </div>
+                )}
+
+                {generatedAudio && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <p style={{ color: '#ececf1', marginBottom: '10px' }}>Generated Audio:</p>
+                    <audio 
+                      controls 
+                      src={generatedAudio} 
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                )}
+
+                {!generatedImage && !generatedAudio && (
+                  <p style={{ color: '#8e8ea0', textAlign: 'center', padding: '40px' }}>
+                    Generated content will appear here
+                  </p>
+                )}
+              </div>
             </div>
-            {conv.image_url && <div style={{ color: '#28a745', fontSize: '12px', marginTop: '5px' }}>🖼️ Image generated</div>}
-            {conv.audio_url && <div style={{ color: '#007bff', fontSize: '12px', marginTop: '5px' }}>🔊 Audio generated</div>}
-          </div>
-        ))}
+          )}
+        </div>
       </div>
 
-      {loading && (
+      {/* Loading Overlay */}
+      {isLoading && (
         <div style={{
           position: 'fixed',
           top: 0, left: 0, right: 0, bottom: 0,
-          backgroundColor: 'rgba(0,0,0,0.5)',
+          backgroundColor: 'rgba(0,0,0,0.7)',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           color: 'white',
-          fontSize: '24px',
+          fontSize: '18px',
           zIndex: 9999
         }}>
-          Processing...
+          <div style={{ textAlign: 'center' }}>
+            <div style={{ marginBottom: '10px' }}>Processing...</div>
+            <div style={{ fontSize: '14px', color: '#8e8ea0' }}>This may take a moment</div>
+          </div>
         </div>
       )}
     </div>
